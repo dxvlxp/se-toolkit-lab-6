@@ -6,6 +6,7 @@
 - [Operating systems](#operating-systems)
   - [`Linux`](#linux)
   - [`macOS`](#macos)
+  - [`iOS`](#ios)
   - [`Windows`](#windows)
     - [`WSL`](#wsl)
 - [Program](#program)
@@ -42,6 +43,12 @@ See [`Linux`](./linux.md) for more details.
 `macOS` is `Apple`'s proprietary operating system for `Mac` computers.
 
 It is based on `Unix`, so many command-line tools and workflows that work on `Linux` also work on `macOS`.
+
+### `iOS`
+
+`iOS` is `Apple`'s proprietary operating system for `iPhone`s and `iPad`s.
+
+Like `macOS`, it is based on `Darwin` (a `Unix`-like core), but it is designed for mobile devices with touchscreens rather than desktop computers.
 
 ### `Windows`
 
