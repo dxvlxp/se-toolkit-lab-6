@@ -1,201 +1,82 @@
-# Agent Architecture
+# AGENT.md
 
 ## Overview
 
-This document describes the architecture of the documentation agent implemented in `agent.py`. The agent is a CLI tool that answers questions by navigating the project wiki using function calling with an LLM.
+This repository contains a CLI agent that answers questions about both the project repository and the running backend system. The agent is designed for Lab 6 Task 3 and extends the Task 2 documentation agent with a live backend tool called `query_api`.
 
-## Agentic Loop
+The agent accepts a user question as the first CLI argument, runs an agentic loop with function calling, and prints exactly one JSON object to stdout. The final output always contains:
+- `answer`
+- `tool_calls`
 
-The agent implements an **agentic loop** that allows the LLM to decide which tools to call, execute them, and reason about the results:
+It may also contain:
+- `source`
 
-```
-Question → LLM (with tool schemas)
-    ↓
-Has tool_calls?
-    ├─ Yes → Execute tools → Append results → Back to LLM (max 10 iterations)
-    └─ No  → Extract answer + source → Output JSON → Exit
-```
-
-### Implementation Flow
-
-1. **Send question to LLM** with tool schemas defined
-2. **Check for tool calls** in the response
-3. **If tool calls exist:**
-   - Execute each tool with the provided arguments
-   - Log the tool call (tool name, args, result)
-   - Append tool results to messages as `role: "tool"`
-   - Continue to next iteration
-4. **If no tool calls:**
-   - Extract the final answer text
-   - Extract the source reference from the answer
-   - Output JSON and exit
-5. **Max iterations:** Stop after 10 tool calls to prevent infinite loops
+The `source` field is included when there is a meaningful file reference to report, such as a wiki page or a source code file.
 
 ## Tools
 
-The agent has two tools available:
+The agent has three tools:
 
-### `read_file(path)`
+### `list_files`
+Lists files and directories inside the repository. This is useful when the model needs to discover the correct path before reading a file. It is especially helpful for the wiki and for `backend/app/routers`.
 
-Reads the contents of a file from the project repository.
+### `read_file`
+Reads a text file from the repository. This is used for:
+- wiki questions,
+- source code inspection,
+- Docker and architecture questions,
+- ETL reasoning,
+- bug diagnosis after reproducing an API error.
 
-**Parameters:**
-- `path` (string): Relative path from project root (e.g., `wiki/git-workflow.md`)
+The implementation prevents path traversal outside the repository root.
 
-**Returns:**
-- File contents as a string
-- Error message if file doesn't exist or path is invalid
+### `query_api`
+Calls the running backend API. It is used for:
+- current counts and live data,
+- real HTTP status codes,
+- authentication behavior,
+- reproducing endpoint crashes before reading the source code.
 
-**Security:**
-- Rejects absolute paths
-- Rejects paths containing `..` (traversal prevention)
-- Verifies resolved path is within project directory
+`query_api` authenticates with `LMS_API_KEY`, which is different from `LLM_API_KEY`. The backend URL is configured through `AGENT_API_BASE_URL`. If it is not set, the agent falls back to `http://localhost:42002`.
 
-### `list_files(path)`
+## Agent loop
 
-Lists files and directories at a given path.
+The loop follows the standard function-calling pattern:
+1. send the question and tool schemas to the LLM;
+2. if the LLM requests tools, execute them;
+3. append tool results back into the conversation;
+4. repeat until the model returns a final answer or the tool-call limit is reached.
 
-**Parameters:**
-- `path` (string): Relative directory path from project root (e.g., `wiki`)
+The implementation handles the common `content: null` tool-calling case by using `(message.get("content") or "")`.
 
-**Returns:**
-- Newline-separated listing of entries (directories have `/` suffix)
-- Error message if path doesn't exist or is not a directory
+## Tool selection strategy
 
-**Security:**
-- Same path validation as `read_file`
+The prompt strongly separates three evidence sources:
+- wiki/docs → `read_file` / `list_files`
+- source code and architecture → `read_file` / `list_files`
+- live system state and endpoint behavior → `query_api`
 
-## Tool Schemas
+For bug-diagnosis questions, the agent is instructed to first reproduce the failure with `query_api` and only then inspect the relevant file with `read_file`. This is important for hidden multi-step questions.
 
-Tools are registered with the LLM using OpenAI function-calling schema format:
+I also added small question-specific hints for common benchmark patterns such as:
+- framework detection from `backend/app/main.py`
+- router discovery in `backend/app/routers`
+- analytics bug diagnosis in `backend/app/routers/analytics.py`
+- ETL idempotency in `backend/app/etl.py`
 
-```python
-TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read contents of a file from the project repository",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path from project root"
-                    }
-                },
-                "required": ["path"]
-            }
-        }
-    },
-    # ... list_files schema
-]
-```
+## Lessons learned
 
-## System Prompt
+The main failure modes in this lab are usually not syntax bugs, but reasoning/tool-selection bugs:
+- the model may answer from prior knowledge without using a tool;
+- it may choose `read_file` when the question actually asks about live runtime state;
+- it may reproduce an API error but forget to inspect the source code afterward.
 
-The system prompt instructs the LLM on how to use the tools effectively:
+To reduce those mistakes, I made the tool descriptions explicit and added task-specific routing hints in the system prompt. I also made `query_api` optionally support unauthenticated requests through `include_auth=false`, which is useful for questions about missing authentication headers.
 
-```
-You are a helpful assistant that answers questions using the project wiki.
+## Benchmark result
 
-You have access to two tools:
-- list_files(path): List files and directories at a given path
-- read_file(path): Read contents of a file
+Initial local score:
+- Pending — replace after the first real `uv run run_eval.py`.
 
-Strategy:
-1. Use list_files to discover relevant wiki files in the wiki/ directory
-2. Use read_file to read specific files and find the answer
-3. Always include the source reference in your answer using format: wiki/filename.md#section-anchor
-
-When answering:
-- Be concise and direct
-- Always provide a source reference
-- If you cannot find the answer, say so clearly
-```
-
-## Output Format
-
-The agent outputs JSON with three fields:
-
-```json
-{
-  "answer": "The answer text",
-  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
-  "tool_calls": [
-    {
-      "tool": "list_files",
-      "args": {"path": "wiki"},
-      "result": "git-workflow.md\n..."
-    },
-    {
-      "tool": "read_file",
-      "args": {"path": "wiki/git-workflow.md"},
-      "result": "..."
-    }
-  ]
-}
-```
-
-### Fields
-
-- **`answer`** (string): The final answer from the LLM
-- **`source`** (string): The wiki section reference extracted from the answer (format: `wiki/filename.md#section-anchor`)
-- **`tool_calls`** (array): All tool calls made during the agentic loop
-  - `tool`: Tool name (`read_file` or `list_files`)
-  - `args`: Arguments passed to the tool
-  - `result`: Result returned by the tool
-
-## Path Security
-
-Both tools implement path validation to prevent accessing files outside the project directory:
-
-```python
-def validate_path(path_str: str) -> Path:
-    # Reject absolute paths
-    if os.path.isabs(path_str):
-        raise ValueError("Path must be relative")
-
-    # Reject traversal
-    if ".." in path_str:
-        raise ValueError("Path traversal not allowed")
-
-    # Resolve and verify
-    resolved = (PROJECT_ROOT / path_str).resolve()
-    if not str(resolved).startswith(str(PROJECT_ROOT)):
-        raise ValueError("Path outside project directory")
-
-    return resolved
-```
-
-## Error Handling
-
-- **Tool errors:** Return error message as tool result, continue loop
-- **LLM API errors:** Print error to stderr and exit with non-zero code
-- **Max iterations:** Return partial answer with tool_calls log
-- **Invalid paths:** Return error message from tool (not a failure)
-
-## Usage
-
-```bash
-# Set environment variables
-export LLM_API_KEY="your-api-key"
-export LLM_API_BASE="https://api.example.com/v1"
-export LLM_MODEL="your-model"
-
-# Run the agent
-python agent.py "How do you resolve a merge conflict?"
-```
-
-## Testing
-
-Run the unit tests:
-
-```bash
-pytest backend/tests/unit/test_agent_task_2.py
-```
-
-Tests verify:
-1. Agent outputs required JSON fields (`answer`, `tool_calls`, `source`)
-2. Agent calls `list_files` when asked about wiki files
-3. Agent calls `read_file` when asked about specific topics
+Final local score:
+- Pending — replace after the final successful benchmark run.
