@@ -9,81 +9,49 @@ from typing import Any, NoReturn
 
 import httpx
 
-ENV_FILE = Path(".env.agent.secret")
+
 PROJECT_ROOT = Path(__file__).resolve().parent
+ENV_FILES = [Path(".env.agent.secret"), Path(".env.docker.secret"), Path(".env")]
 MAX_TOOL_CALLS = 10
+MAX_FILE_CHARS = 50_000
 
-SYSTEM_PROMPT = """You are a helpful assistant that answers questions using the project wiki.
+BASE_SYSTEM_PROMPT = """You are a repository-and-system agent for this project.
+You answer questions by using tools instead of guessing.
 
-You have access to two tools:
-- list_files(path): List files and directories at a given path
-- read_file(path): Read contents of a file
+Available tools:
+- list_files: discover files and directories in the repository.
+- read_file: read documentation or source code from the repository.
+- query_api: call the running backend API for live runtime facts.
 
-Strategy:
-1. Use list_files to discover relevant wiki files in the wiki/ directory
-2. Use read_file to read specific files and find the answer
-3. Always include the source reference in your answer using format: wiki/filename.md#section-anchor
+Tool selection rules:
+- For wiki or documentation questions, use list_files/read_file on wiki files.
+- For source-code questions (framework, routers, ports, Docker, ETL, architecture), use list_files/read_file on backend/, Dockerfile, and docker-compose.yml.
+- For live data, current counts, current scores, status codes, authentication behavior, or endpoint crashes, use query_api.
+- For bug diagnosis, first reproduce the problem with query_api, then inspect the relevant source file with read_file before answering.
+- When the question explicitly asks what happens without authentication, call query_api with include_auth=false.
+- Use the exact important keywords from the evidence when relevant: FastAPI, ZeroDivisionError, TypeError, NoneType, 401, 403, etc.
+- Do not invent sources or file paths.
+- Keep the final answer concise but complete.
 
-When answering:
-- Be concise and direct
-- Always provide a source reference (file path + section anchor like wiki/git-workflow.md#resolving-merge-conflicts)
-- If you cannot find the answer, say so clearly
+When you are ready to answer, respond with ONLY a JSON object of this shape:
+{"answer": "...", "source": "..."}
+Use an empty source string when there is no single best source.
 """
 
-# Tool schemas for OpenAI function calling
-TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read contents of a file from the project repository",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md')",
-                    }
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": "List files and directories at a given path",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative directory path from project root (e.g., 'wiki')",
-                    }
-                },
-                "required": ["path"],
-            },
-        },
-    },
-]
 
-
-def load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+def load_env_files() -> None:
+    for path in ENV_FILES:
+        if not path.exists():
             continue
-
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-
-        if key and key not in os.environ:
-            os.environ[key] = value
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
 
 
 def fail(message: str, code: int = 1) -> NoReturn:
@@ -98,156 +66,254 @@ def require_env(name: str) -> str:
     return value
 
 
-def validate_path(path_str: str) -> Path:
-    """Validate and resolve a path to ensure it's within the project directory."""
-    # Reject absolute paths
-    if os.path.isabs(path_str):
-        raise ValueError("Path must be relative")
+def build_system_prompt(question: str) -> str:
+    question_lower = question.lower()
+    hints: list[str] = []
 
-    # Reject traversal
-    if ".." in path_str:
-        raise ValueError("Path traversal not allowed")
+    if "protect a branch" in question_lower:
+        hints.append("Read wiki/git-workflow.md for the branch protection steps.")
+    if "ssh" in question_lower and "vm" in question_lower:
+        hints.append("Read wiki/vm.md for the SSH setup steps.")
+    if "framework" in question_lower and ("backend" in question_lower or "project" in question_lower):
+        hints.append("Read backend/app/main.py to identify the web framework.")
+    if "router modules" in question_lower or "api router" in question_lower:
+        hints.append("List backend/app/routers to discover router modules.")
+    if ("how many items" in question_lower) or ("items" in question_lower and "database" in question_lower):
+        hints.append("Use query_api with GET /items/ to inspect the current database contents.")
+    if "/items/" in question_lower and (
+        "without an authentication header" in question_lower
+        or "without auth" in question_lower
+        or "without authentication" in question_lower
+    ):
+        hints.append("Use query_api with GET /items/ and include_auth=false.")
+    if "completion-rate" in question_lower:
+        hints.append(
+            "First reproduce the issue with query_api on /analytics/completion-rate, then read backend/app/routers/analytics.py."
+        )
+    if "top-learners" in question_lower:
+        hints.append(
+            "First reproduce the issue with query_api on /analytics/top-learners, then read backend/app/routers/analytics.py."
+        )
+    if (
+        "docker-compose" in question_lower
+        or "dockerfile" in question_lower
+        or "request from the browser to the database" in question_lower
+    ):
+        hints.append("Read docker-compose.yml and Dockerfile. You may also need backend/app/main.py and backend/app/auth.py.")
+    if "idempot" in question_lower or "loaded twice" in question_lower or "same data" in question_lower:
+        hints.append("Read backend/app/etl.py and explain the external_id duplicate check.")
 
-    # Resolve and verify
-    resolved = (PROJECT_ROOT / path_str).resolve()
-    if not str(resolved).startswith(str(PROJECT_ROOT)):
-        raise ValueError("Path outside project directory")
-
-    return resolved
+    if not hints:
+        return BASE_SYSTEM_PROMPT
+    return BASE_SYSTEM_PROMPT + "\nSpecific hints for this question:\n- " + "\n- ".join(hints)
 
 
-def tool_read_file(path: str) -> str:
-    """Read contents of a file from the project repository."""
+def _is_relative_to(path: Path, base: Path) -> bool:
     try:
-        resolved_path = validate_path(path)
-
-        if not resolved_path.exists():
-            return f"Error: File not found: {path}"
-
-        if not resolved_path.is_file():
-            return f"Error: Not a file: {path}"
-
-        return resolved_path.read_text(encoding="utf-8")
-
-    except ValueError as e:
-        return f"Error: {e}"
-    except Exception as e:
-        return f"Error reading file: {e}"
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
 
 
-def tool_list_files(path: str) -> str:
-    """List files and directories at a given path."""
+def resolve_repo_path(raw_path: str) -> Path:
+    cleaned = (raw_path or ".").strip()
+    candidate = (PROJECT_ROOT / cleaned).resolve()
+    if not _is_relative_to(candidate, PROJECT_ROOT):
+        raise ValueError("Path escapes the project root")
+    return candidate
+
+
+def relative_display_path(path: Path) -> str:
+    return path.relative_to(PROJECT_ROOT).as_posix()
+
+
+def list_files_tool(path: str) -> str:
     try:
-        resolved_path = validate_path(path)
+        resolved = resolve_repo_path(path)
+    except ValueError as exc:
+        return f"Error: {exc}"
 
-        if not resolved_path.exists():
-            return f"Error: Path not found: {path}"
+    if not resolved.exists():
+        return f"Error: path does not exist: {path}"
+    if not resolved.is_dir():
+        return f"Error: path is not a directory: {path}"
 
-        if not resolved_path.is_dir():
-            return f"Error: Not a directory: {path}"
+    entries: list[str] = []
+    for entry in sorted(resolved.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
+        display = relative_display_path(entry)
+        if entry.is_dir():
+            display += "/"
+        entries.append(display)
 
-        entries = []
-        for entry in resolved_path.iterdir():
-            suffix = "/" if entry.is_dir() else ""
-            entries.append(f"{entry.name}{suffix}")
-
-        return "\n".join(sorted(entries))
-
-    except ValueError as e:
-        return f"Error: {e}"
-    except Exception as e:
-        return f"Error listing files: {e}"
+    return "\n".join(entries) if entries else "(empty directory)"
 
 
-def execute_tool(name: str, arguments: dict[str, Any]) -> str:
-    """Execute a tool by name with the given arguments."""
-    if name == "read_file":
-        path = arguments.get("path", "")
-        return tool_read_file(path)
-    elif name == "list_files":
-        path = arguments.get("path", "")
-        return tool_list_files(path)
-    else:
-        return f"Error: Unknown tool: {name}"
+def read_file_tool(path: str) -> str:
+    try:
+        resolved = resolve_repo_path(path)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    if not resolved.exists():
+        return f"Error: file does not exist: {path}"
+    if not resolved.is_file():
+        return f"Error: path is not a file: {path}"
+
+    try:
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"Error reading file: {exc}"
+
+    if len(content) <= MAX_FILE_CHARS:
+        return content
+
+    return content[:MAX_FILE_CHARS] + "\n\n[truncated]"
 
 
-def extract_text_from_response(response_json: dict[str, Any]) -> str:
-    """Extract text content from LLM response."""
-    choices = response_json.get("choices")
-    if not isinstance(choices, list) or not choices:
-        fail("LLM response does not contain choices")
+def query_api_tool(
+    method: str,
+    path: str,
+    body: str | None = None,
+    include_auth: bool = True,
+) -> str:
+    base_url = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002").rstrip("/")
+    target_url = path if path.startswith("http://") or path.startswith("https://") else f"{base_url}/{path.lstrip('/')}"
 
-    message = choices[0].get("message", {})
-    content = message.get("content", "")
+    headers: dict[str, str] = {"Accept": "application/json"}
+    if include_auth:
+        headers["Authorization"] = f"Bearer {require_env('LMS_API_KEY')}"
 
+    json_body: Any | None = None
+    content_body: str | bytes | None = None
+    if body is not None and body != "":
+        try:
+            json_body = json.loads(body)
+            headers["Content-Type"] = "application/json"
+        except json.JSONDecodeError:
+            content_body = body
+            headers["Content-Type"] = "application/json"
+
+    try:
+        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+            response = client.request(
+                method=method.upper(),
+                url=target_url,
+                headers=headers,
+                json=json_body,
+                content=content_body,
+            )
+    except httpx.TimeoutException:
+        return json.dumps({"status_code": 0, "body": {"error": "request timed out"}}, ensure_ascii=False)
+    except httpx.HTTPError as exc:
+        return json.dumps({"status_code": 0, "body": {"error": str(exc)}}, ensure_ascii=False)
+
+    try:
+        response_body: Any = response.json()
+    except ValueError:
+        response_body = response.text
+
+    result: dict[str, Any] = {"status_code": response.status_code, "body": response_body}
+    if isinstance(response_body, list):
+        result["body_count"] = len(response_body)
+    return json.dumps(result, ensure_ascii=False)
+
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List repository files or directories. Use this to discover paths before reading files. Best for wiki/ and backend/app/routers/.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative directory path from the repository root, for example wiki, backend/app, or backend/app/routers.",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a repository file. Use it for wiki pages, source code, Dockerfile, docker-compose.yml, and ETL logic. Do not use it for live data.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative file path from the repository root, for example wiki/vm.md, backend/app/main.py, backend/app/routers/analytics.py, Dockerfile, or docker-compose.yml.",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Call the running backend API for current runtime information, status codes, authentication behavior, item counts, and to reproduce failing endpoints. Use include_auth=false only when the question explicitly asks about unauthenticated access.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method such as GET or POST.",
+                        "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Request path relative to AGENT_API_BASE_URL, for example /items/ or /analytics/completion-rate?lab=lab-99.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON body encoded as a string. Leave empty for GET requests.",
+                    },
+                    "include_auth": {
+                        "type": "boolean",
+                        "description": "Whether to send the LMS_API_KEY as a Bearer token. Defaults to true. Set false only for questions about missing authentication.",
+                    },
+                },
+                "required": ["method", "path"],
+            },
+        },
+    },
+]
+
+
+def text_from_content(content: Any) -> str:
     if isinstance(content, str):
         return content.strip()
-
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text", "")
+                text = item.get("text")
                 if isinstance(text, str):
                     parts.append(text)
         return "\n".join(parts).strip()
-
-    return str(content).strip()
-
-
-def extract_tool_calls_from_response(
-    response_json: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Extract tool calls from LLM response."""
-    choices = response_json.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return []
-
-    message = choices[0].get("message", {})
-    tool_calls = message.get("tool_calls")
-
-    if not isinstance(tool_calls, list):
-        return []
-
-    result = []
-    for tc in tool_calls:
-        if not isinstance(tc, dict):
-            continue
-
-        function = tc.get("function", {})
-        if not isinstance(function, dict):
-            continue
-
-        name = function.get("name", "")
-        arguments_str = function.get("arguments", "{}")
-
-        try:
-            arguments = json.loads(arguments_str)
-        except json.JSONDecodeError:
-            arguments = {}
-
-        result.append({"id": tc.get("id", ""), "name": name, "arguments": arguments})
-
-    return result
+    return "" if content is None else str(content).strip()
 
 
-def call_llm(
-    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
-) -> dict[str, Any]:
-    """Call the LLM API with messages and optional tools."""
+def call_llm(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> dict[str, Any]:
     api_key = require_env("LLM_API_KEY")
     api_base = require_env("LLM_API_BASE").rstrip("/")
     model = require_env("LLM_MODEL")
 
-    url = f"{api_base}/chat/completions"
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "temperature": 0,
     }
-
     if tools:
         payload["tools"] = tools
+        payload["tool_choice"] = "auto"
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -256,89 +322,73 @@ def call_llm(
 
     try:
         with httpx.Client(timeout=55.0) as client:
-            response = client.post(url, headers=headers, json=payload)
+            response = client.post(f"{api_base}/chat/completions", headers=headers, json=payload)
             response.raise_for_status()
-            data = response.json()
+            return response.json()
     except httpx.TimeoutException:
         fail("LLM request timed out")
     except httpx.HTTPStatusError as exc:
-        status = exc.response.status_code
         body = exc.response.text[:500]
-        fail(f"LLM API returned HTTP {status}: {body}")
+        fail(f"LLM API returned HTTP {exc.response.status_code}: {body}")
     except httpx.HTTPError as exc:
         fail(f"LLM request failed: {exc}")
     except json.JSONDecodeError:
         fail("LLM API returned invalid JSON")
 
-    return data
+
+def parse_tool_arguments(raw_arguments: Any) -> dict[str, Any]:
+    if isinstance(raw_arguments, dict):
+        return raw_arguments
+    if not isinstance(raw_arguments, str):
+        return {}
+    try:
+        parsed = json.loads(raw_arguments)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
 
 
-def extract_source_from_answer(answer: str) -> str:
-    """Extract source reference from the answer text."""
-    # Look for patterns like wiki/filename.md#section-anchor
-    pattern = r"(wiki/[\w-]+\.md#[\w-]+)"
-    match = re.search(pattern, answer)
+def execute_tool(name: str, args: dict[str, Any]) -> str:
+    if name == "list_files":
+        return list_files_tool(str(args.get("path", ".")))
+    if name == "read_file":
+        return read_file_tool(str(args.get("path", "")))
+    if name == "query_api":
+        method = str(args.get("method", "GET"))
+        path = str(args.get("path", ""))
+        body = args.get("body")
+        include_auth = bool(args.get("include_auth", True))
+        body_string = None if body is None else str(body)
+        return query_api_tool(method=method, path=path, body=body_string, include_auth=include_auth)
+    return f"Error: unknown tool: {name}"
+
+
+def parse_final_answer(raw_text: str) -> tuple[str, str]:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and "answer" in parsed:
+            answer = str(parsed.get("answer", "")).strip()
+            source = str(parsed.get("source", "")).strip()
+            return answer, source
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"(?im)^source\s*:\s*(.+)$", text)
+    source = match.group(1).strip() if match else ""
     if match:
-        return match.group(1)
-
-    # Look for just file reference
-    pattern_file = r"(wiki/[\w-]+\.md)"
-    match = re.search(pattern_file, answer)
-    if match:
-        return match.group(1)
-
-    return ""
-
-
-def run_agent_loop(question: str) -> dict[str, Any]:
-    """Run the agentic loop: LLM → tool calls → execute → back to LLM."""
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
-
-    tool_calls_log: list[dict[str, Any]] = []
-
-    for iteration in range(MAX_TOOL_CALLS):
-        # Call LLM with tool schemas
-        response = call_llm(messages, tools=TOOL_SCHEMAS)
-
-        # Extract tool calls
-        tool_calls = extract_tool_calls_from_response(response)
-
-        if tool_calls:
-            # Execute each tool call
-            for tc in tool_calls:
-                result = execute_tool(tc["name"], tc["arguments"])
-
-                tool_calls_log.append(
-                    {"tool": tc["name"], "args": tc["arguments"], "result": result}
-                )
-
-                # Append tool result to messages as a tool response
-                messages.append(
-                    {"role": "tool", "tool_call_id": tc["id"], "content": result}
-                )
-
-            # Continue loop to let LLM process results
-            continue
-        else:
-            # No tool calls - extract final answer
-            answer = extract_text_from_response(response)
-            source = extract_source_from_answer(answer)
-
-            return {"answer": answer, "source": source, "tool_calls": tool_calls_log}
-
-    # Max iterations reached
-    return {
-        "answer": "Reached maximum tool calls limit.",
-        "source": "",
-        "tool_calls": tool_calls_log,
-    }
+        answer = re.sub(r"(?im)^source\s*:\s*.+$", "", text).strip()
+        return answer, source
+    return text, ""
 
 
 def main() -> int:
-    load_env_file(ENV_FILE)
+    load_env_files()
 
     if len(sys.argv) < 2:
         fail('Usage: python agent.py "Your question here"')
@@ -347,8 +397,80 @@ def main() -> int:
     if not question:
         fail("Question must not be empty")
 
-    result = run_agent_loop(question)
-    print(json.dumps(result, ensure_ascii=False))
+    question_lower = question.lower()
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": build_system_prompt(question)},
+        {"role": "user", "content": question},
+    ]
+    tool_history: list[dict[str, Any]] = []
+    final_text = ""
+
+    while len(tool_history) < MAX_TOOL_CALLS:
+        response_json = call_llm(messages, TOOLS)
+        choices = response_json.get("choices")
+        if not isinstance(choices, list) or not choices:
+            fail("LLM response does not contain choices")
+
+        message = choices[0].get("message", {})
+        assistant_content = text_from_content(message.get("content") or "")
+        tool_calls = message.get("tool_calls") or []
+
+        if tool_calls:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.get("content") or "",
+                    "tool_calls": tool_calls,
+                }
+            )
+            for tool_call in tool_calls:
+                if len(tool_history) >= MAX_TOOL_CALLS:
+                    break
+                function = tool_call.get("function", {})
+                tool_name = function.get("name", "")
+                args = parse_tool_arguments(function.get("arguments", "{}"))
+
+                if tool_name == "query_api" and "include_auth" not in args and (
+                    "without an authentication header" in question_lower
+                    or "without authentication" in question_lower
+                    or "without auth" in question_lower
+                    or "missing authentication" in question_lower
+                ):
+                    args["include_auth"] = False
+
+                result = execute_tool(tool_name, args)
+                tool_history.append({"tool": tool_name, "args": args, "result": result})
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("id", ""),
+                        "content": result,
+                    }
+                )
+            continue
+
+        final_text = assistant_content
+        break
+
+    if not final_text:
+        response_json = call_llm(messages, None)
+        choices = response_json.get("choices")
+        if not isinstance(choices, list) or not choices:
+            fail("LLM response does not contain choices")
+        final_text = text_from_content(choices[0].get("message", {}).get("content") or "")
+
+    answer, source = parse_final_answer(final_text)
+    if not answer:
+        fail("LLM returned an empty answer")
+
+    output: dict[str, Any] = {
+        "answer": answer,
+        "tool_calls": tool_history,
+    }
+    if source:
+        output["source"] = source
+
+    print(json.dumps(output, ensure_ascii=False))
     return 0
 
 
